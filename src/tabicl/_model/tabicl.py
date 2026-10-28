@@ -8,7 +8,7 @@ from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
 from .quantile_dist import QuantileToDistribution
-from .kv_cache import TabICLCache
+from .kv_cache import KVCache, TabICLCache
 from .inference_config import InferenceConfig
 
 
@@ -358,6 +358,113 @@ class TabICL(nn.Module):
         # Dataset-wise in-context learning
         return self.icl_predictor(representations, y_train=y_train)
 
+    def _embed_rows_chunked(
+        self,
+        X: Tensor,
+        col_cache: KVCache,
+        row_chunk_size: int,
+        y_train: Optional[Tensor] = None,
+        feature_shuffles: Optional[List[List[int]]] = None,
+        inference_config: Optional[InferenceConfig] = None,
+    ) -> Tensor:
+        """Column-wise embedding -> row-wise interaction, a chunk of rows at a time.
+
+        Once the inducing points of the column-wise set transformer have attended
+        to the training rows, every row is embedded independently of all others.
+        So if ``col_cache`` is not populated yet, it is first filled from the
+        training rows without gathering any output. The column embeddings of
+        shape (B, T, H+C, E) then only ever exist for ``row_chunk_size`` rows,
+        and only the row representations (B, T, C*E) are kept for all rows.
+
+        Parameters
+        ----------
+        X : Tensor
+            Input tensor of shape (B, T, H). If ``y_train`` is given, the first
+            ``y_train.shape[1]`` rows are the training rows.
+
+        col_cache : KVCache
+            Cache of the column-wise embedding. If empty, it is populated from the
+            training rows of ``X``, which requires ``y_train``.
+
+        row_chunk_size : int
+            Maximum number of rows embedded at once.
+
+        y_train : Optional[Tensor], default=None
+            Training labels of shape (B, train_size) for the leading rows of ``X``.
+            None if ``X`` contains only test rows, e.g. when using a stored cache.
+
+        feature_shuffles : Optional[List[List[int]]], default=None
+            Feature shuffle patterns of the tables in ``X``, see ``forward``. Only
+            used to skip redundant column-wise embedding when feature grouping is
+            disabled. ``col_cache`` must then be empty, as only the first table
+            is embedded.
+
+        inference_config : Optional[InferenceConfig], default=None
+            Inference configuration.
+
+        Returns
+        -------
+        Tensor
+            Row representations of shape (B, T, C*E).
+        """
+        if inference_config is None:
+            inference_config = InferenceConfig()
+
+        T = X.shape[1]
+        if feature_shuffles is not None and not self.col_embedder.feature_group:
+            # Column-wise embeddings are computed for the first table only and
+            # permuted for the others, as in ColEmbedding._inference_forward
+            X = X[:1]
+            y_train = y_train[:1] if y_train is not None else None
+        else:
+            feature_shuffles = None
+
+        n_labeled = 0 if y_train is None else y_train.shape[1]
+        if not col_cache.is_populated():
+            assert y_train is not None, "y_train is required to populate the column embedding cache."
+            self.col_embedder.forward_with_cache(
+                X[:, :n_labeled],
+                col_cache=col_cache,
+                y_train=y_train,
+                store_cache=True,
+                use_cache=False,
+                mgr_config=inference_config.COL_CONFIG,
+                discard_output=True,
+            )
+
+        representations = []
+        for start in range(0, T, row_chunk_size):
+            end = min(start + row_chunk_size, T)
+            # Training rows in the chunk get their label embedding, as in the unchunked forward pass
+            y_chunk = y_train[:, start : min(end, n_labeled)] if start < n_labeled else None
+            embeddings = self.col_embedder.forward_with_cache(
+                X[:, start:end],
+                col_cache=col_cache,
+                y_train=y_chunk,
+                use_cache=True,
+                store_cache=False,
+                mgr_config=inference_config.COL_CONFIG,
+            )  # (1 or B, chunk, H+C, E)
+            if feature_shuffles is not None:
+                embeddings = self.col_embedder.apply_feature_shuffles(embeddings[0].transpose(0, 1), feature_shuffles)
+                embeddings = embeddings.transpose(1, 2)  # (B, chunk, H+C, E)
+            representations.append(self.row_interactor(embeddings, mgr_config=inference_config.ROW_CONFIG))
+            del embeddings
+
+        return torch.cat(representations, dim=1)
+
+    def _can_chunk_rows(self, y_train: Tensor, embed_with_test: bool = False) -> bool:
+        """Whether the column-wise embedding is row-separable for this input.
+
+        It is not when the inducing points also attend to test rows, or when
+        mixed-radix ensembling runs the column-wise embedding once per digit.
+        """
+        if embed_with_test:
+            return False
+        if self.col_embedder.target_aware and self.max_classes > 0:
+            return int(y_train.max().item()) + 1 <= self.max_classes
+        return True
+
     def _inference_forward(
         self,
         X: Tensor,
@@ -419,16 +526,27 @@ class TabICL(nn.Module):
             inference_config = InferenceConfig()
 
         # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
+        row_chunk_size = inference_config.ROW_CHUNK_SIZE
+        if row_chunk_size is not None and X.shape[1] > row_chunk_size and self._can_chunk_rows(y_train, embed_with_test):
+            representations = self._embed_rows_chunked(
                 X,
+                col_cache=KVCache(),
+                row_chunk_size=row_chunk_size,
                 y_train=y_train,
-                embed_with_test=embed_with_test,
                 feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
-        )
+                inference_config=inference_config,
+            )
+        else:
+            representations = self.row_interactor(
+                self.col_embedder(
+                    X,
+                    y_train=y_train,
+                    embed_with_test=embed_with_test,
+                    feature_shuffles=feature_shuffles,
+                    mgr_config=inference_config.COL_CONFIG,
+                ),
+                mgr_config=inference_config.ROW_CONFIG,
+            )
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
@@ -742,17 +860,28 @@ class TabICL(nn.Module):
             y_train = None
 
         # Column-wise embedding with cache support -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder.forward_with_cache(
+        row_chunk_size = inference_config.ROW_CHUNK_SIZE
+        if row_chunk_size is not None and X.shape[1] > row_chunk_size:
+            # Mixed-radix ensembling, which cannot be chunked, is rejected by caching anyway
+            representations = self._embed_rows_chunked(
                 X,
                 col_cache=self._cache.col_cache,
+                row_chunk_size=row_chunk_size,
                 y_train=y_train,
-                use_cache=use_cache,
-                store_cache=store_cache,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
-        )
+                inference_config=inference_config,
+            )
+        else:
+            representations = self.row_interactor(
+                self.col_embedder.forward_with_cache(
+                    X,
+                    col_cache=self._cache.col_cache,
+                    y_train=y_train,
+                    use_cache=use_cache,
+                    store_cache=store_cache,
+                    mgr_config=inference_config.COL_CONFIG,
+                ),
+                mgr_config=inference_config.ROW_CONFIG,
+            )
 
         # Dataset-wise in-context learning
         if cache_mode == "repr":

@@ -214,9 +214,11 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             - The ``device``, ``use_amp``, ``use_fa3``, ``offload_mode``, ``disk_offload_dir``, and ``verbose``
               parameters from the class initialization are applied to the relevant components
 
-        When Dict with allowed top-level keys "COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG":
+        When Dict with allowed top-level keys "COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG", "ROW_CHUNK_SIZE":
             - A new InferenceConfig object is created with default settings
             - Any values explicitly specified in the dictionary will override default defaults
+            - ``ROW_CHUNK_SIZE`` (int) embeds the table in chunks of that many rows to lower
+              peak memory, see :class:`~tabicl._model.inference_config.InferenceConfig`
             - ``device``, ``use_amp``, ``use_fa3``, ``offload_mode``, ``disk_offload_dir``, and ``verbose``
               from the class initialization are used if they are not specified in the dictionary
 

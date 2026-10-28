@@ -171,6 +171,8 @@ class TabICLBaseEstimator(BaseEstimator):
             for key, value in self.inference_config.items():
                 if key in init_config:
                     init_config[key].update(value)
+                else:
+                    init_config[key] = value
             self.inference_config_.update_from_dict(init_config)
         else:
             self.inference_config_ = self.inference_config

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -243,13 +243,34 @@ class MgrConfig:
 
 @dataclass
 class InferenceConfig:
-    """Configuration class for inference."""
+    """Configuration class for inference.
+
+    Attributes
+    ----------
+    COL_CONFIG, ROW_CONFIG, ICL_CONFIG : MgrConfig
+        ``InferenceManager`` configurations of the column-wise embedding, the
+        row-wise interaction and the in-context learning stages.
+
+    ROW_CHUNK_SIZE : Optional[int], default=None
+        If set, the column-wise embedding and the row-wise interaction are run
+        on at most this many rows at a time. The column embeddings of shape
+        (B, T, H+C, E) are by far the largest intermediate tensor; chunking
+        only ever materializes them for ``ROW_CHUNK_SIZE`` rows, and keeps the
+        much smaller row representations (B, T, C*E) for the whole table.
+        Predictions are unchanged up to floating-point noise. Chunking is
+        skipped when ``embed_with_test=True`` and for classification with more
+        classes than the model supports, as neither can embed rows
+        independently. If None, all rows are processed at once.
+    """
 
     COL_CONFIG: MgrConfig = None
     ROW_CONFIG: MgrConfig = None
     ICL_CONFIG: MgrConfig = None
+    ROW_CHUNK_SIZE: Optional[int] = None
 
     def __post_init__(self):
+        self._validate_row_chunk_size(self.ROW_CHUNK_SIZE)
+
         if isinstance(self.COL_CONFIG, dict):
             self.COL_CONFIG = MgrConfig(**self.COL_CONFIG)
         elif self.COL_CONFIG is None:
@@ -349,6 +370,11 @@ class InferenceConfig:
         elif not isinstance(self.ICL_CONFIG, MgrConfig):
             raise TypeError(f"ICL_CONFIG must be a dict or MgrConfig, got {type(self.ICL_CONFIG)}")
 
+    @staticmethod
+    def _validate_row_chunk_size(value):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"ROW_CHUNK_SIZE must be None or an integer >= 1, got {value!r}")
+
     def update_from_dict(self, config_dict: Dict[str, Dict]):
         """Update configurations from a dictionary.
 
@@ -356,7 +382,8 @@ class InferenceConfig:
         ----------
         config_dict : Dict[str, Dict]
             Dictionary containing configuration updates for ``COL_CONFIG``,
-            ``ROW_CONFIG``, and/or ``ICL_CONFIG``.
+            ``ROW_CONFIG``, and/or ``ICL_CONFIG``, and/or a new value for
+            ``ROW_CHUNK_SIZE``.
 
         Raises
         ------
@@ -364,9 +391,13 @@ class InferenceConfig:
             If dictionary contains keys other than the allowed configuration
             names.
         """
-        allowed_keys = {"COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG"}
+        allowed_keys = {"COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG", "ROW_CHUNK_SIZE"}
         for key in config_dict:
             if key not in allowed_keys:
                 raise KeyError(f"Invalid config key: {key}. Allowed keys: {allowed_keys}")
 
-            getattr(self, key).update(config_dict[key])
+            if key == "ROW_CHUNK_SIZE":
+                self._validate_row_chunk_size(config_dict[key])
+                self.ROW_CHUNK_SIZE = config_dict[key]
+            else:
+                getattr(self, key).update(config_dict[key])
