@@ -372,9 +372,11 @@ class TabICL(nn.Module):
         Once the inducing points of the column-wise set transformer have attended
         to the training rows, every row is embedded independently of all others.
         So if ``col_cache`` is not populated yet, it is first filled from the
-        training rows without gathering any output. The column embeddings of
-        shape (B, T, H+C, E) then only ever exist for ``row_chunk_size`` rows,
-        and only the row representations (B, T, C*E) are kept for all rows.
+        training rows without gathering any output, also in row chunks (the
+        inducing points attend to the training rows with an online softmax). The
+        column embeddings of shape (B, T, H+C, E) then only ever exist for
+        ``row_chunk_size`` rows, and only the row representations (B, T, C*E)
+        are kept for all rows.
 
         Parameters
         ----------
@@ -430,6 +432,7 @@ class TabICL(nn.Module):
                 use_cache=False,
                 mgr_config=inference_config.COL_CONFIG,
                 discard_output=True,
+                row_chunk_size=row_chunk_size,
             )
 
         representations = []

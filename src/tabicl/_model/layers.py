@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from .ssmax import create_ssmax_layer
 from .rope import RotaryEmbedding
-from .attention import multi_head_attention_forward
+from .attention import chunked_kv_attention_forward, multi_head_attention_forward
 from .kv_cache import KVCacheEntry, KVCache
 
 
@@ -494,6 +494,54 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
 
         return x
 
+    def forward_chunked_kv(self, q: Tensor, kv: Tensor, chunk_size: int) -> Tensor:
+        """Attend from ``q`` to a long key/value sequence, a chunk at a time.
+
+        Equivalent to ``forward(q, kv, kv)`` in eval mode, but the normalized
+        keys and values and the attention scores only ever exist for
+        ``chunk_size`` positions of ``kv``, see ``chunked_kv_attention_forward``.
+
+        Parameters
+        ----------
+        q : Tensor
+            Query tensor of shape (..., tgt_len, d_model).
+
+        kv : Tensor
+            Key and value tensor of shape (..., src_len, d_model).
+
+        chunk_size : int
+            Number of key/value positions processed at once.
+
+        Returns
+        -------
+        Tensor
+            Output tensor of shape (..., tgt_len, d_model).
+        """
+
+        def attn_block(query: Tensor, kv_norm: Optional[nn.Module]) -> Tensor:
+            attn = chunked_kv_attention_forward(
+                query,
+                kv,
+                self.attn.num_heads,
+                self.attn.in_proj_weight,
+                self.attn.in_proj_bias,
+                self.attn.out_proj.weight,
+                self.attn.out_proj.bias,
+                chunk_size=chunk_size,
+                kv_norm=kv_norm,
+                ssmax_layer=self.attn.ssmax_layer,
+            )
+            return self.dropout1(attn)
+
+        if self.norm_first:
+            x = q + attn_block(self.norm1(q), kv_norm=self.norm1)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            x = self.norm1(q + attn_block(q, kv_norm=None))
+            x = self.norm2(x + self._ff_block(x))
+
+        return x
+
     def _attn_block(
         self,
         q: Tensor,
@@ -793,3 +841,80 @@ class InducedSelfAttentionBlock(nn.Module):
             if skip_mask.any():
                 out[skip_mask] = self.skip_value
             return out
+
+    def store_cache_chunked(
+        self,
+        src: Tensor,
+        col_cache: KVCache,
+        block_idx: int,
+        row_chunk_size: int,
+        need_output: bool = True,
+    ) -> Optional[Tensor]:
+        """Store the cache of this block from training rows, a chunk of rows at a time.
+
+        Equivalent to ``forward_with_cache(src, col_cache, block_idx,
+        train_size=src.shape[-2], store_cache=True)``, but apart from ``src``,
+        intermediate tensors only ever exist for ``row_chunk_size`` rows: the
+        inducing points attend to ``src`` with an online softmax over row
+        chunks, and the rows then attend to the resulting ``hidden`` chunk by
+        chunk. Each output chunk overwrites the corresponding chunk of ``src``
+        (unless their dtypes differ), so ``src`` must not be used afterwards.
+
+        Parameters
+        ----------
+        src : Tensor
+            Training rows of shape (..., train_size, d_model). May be overwritten.
+
+        col_cache : KVCache
+            Cache object in which the K/V of ``hidden`` are stored.
+
+        block_idx : int
+            Index of this block for cache key.
+
+        row_chunk_size : int
+            Maximum number of rows processed at once.
+
+        need_output : bool, default=True
+            If False, only populate the cache and return None, which skips the
+            second attention stage, e.g. for the last block of a cache-only pass.
+
+        Returns
+        -------
+        Optional[Tensor]
+            Output tensor with same shape as ``src``, or None if ``need_output=False``.
+        """
+        *batch_shape, train_size, d_model = src.shape
+
+        skip_mask = torch.ones(batch_shape, dtype=torch.bool, device=src.device)
+        for start in range(0, train_size, row_chunk_size):
+            skip_mask &= (src[..., start : start + row_chunk_size, :] == self.skip_value).all(dim=(-2, -1))
+        if skip_mask.all():
+            # Same as forward_with_cache: no cache entry for fully skipped inputs
+            return torch.full_like(src, self.skip_value) if need_output else None
+
+        ind_vectors = self.ind_vectors.expand(*batch_shape, self.num_inds, d_model)
+        hidden = self.multihead_attn1.forward_chunked_kv(ind_vectors, src, chunk_size=row_chunk_size)
+
+        # Only the K/V of hidden are cached, which do not depend on the queries
+        out_chunk, k_proj, v_proj = self.multihead_attn2(src[..., :row_chunk_size, :], hidden, hidden, need_kv=True)
+        cached_kv = KVCacheEntry(key=k_proj, value=v_proj)
+        col_cache.kv[block_idx] = cached_kv
+        if not need_output:
+            return None
+
+        # Rows only attend to hidden from here on, so each chunk of src can be
+        # overwritten by its output once it has been processed
+        if out_chunk.dtype == src.dtype and out_chunk.device == src.device:
+            out = src
+        else:
+            out = torch.empty(src.shape, dtype=out_chunk.dtype, device=out_chunk.device)
+        out[..., :row_chunk_size, :] = out_chunk
+        del out_chunk
+        for start in range(row_chunk_size, train_size, row_chunk_size):
+            out[..., start : start + row_chunk_size, :] = self.multihead_attn2(
+                src[..., start : start + row_chunk_size, :], cached_kv=cached_kv
+            )
+
+        if skip_mask.any():
+            out[skip_mask] = self.skip_value
+        return out

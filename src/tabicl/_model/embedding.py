@@ -755,6 +755,12 @@ class ColEmbedding(nn.Module):
 
         return embeddings  # (B, T, G+C, E)
 
+    def _embed_labels(self, y: Tensor) -> Tensor:
+        """Embed target values of shape (...) into shape (..., E)."""
+        if self.max_classes > 0:
+            return self.y_encoder(y.float())
+        return self.y_encoder(y.unsqueeze(-1))
+
     def _compute_embeddings_with_cache(
         self,
         features: Tensor,
@@ -763,7 +769,8 @@ class ColEmbedding(nn.Module):
         y_train: Optional[Tensor] = None,
         use_cache: bool = False,
         store_cache: bool = True,
-    ) -> Tensor:
+        row_chunk_size: Optional[int] = None,
+    ) -> Optional[Tensor]:
         """Feature embedding using a shared set transformer with KV caching.
 
         Parameters
@@ -790,11 +797,31 @@ class ColEmbedding(nn.Module):
         store_cache : bool, default=True
             Whether to store computed values in cache.
 
+        row_chunk_size : Optional[int], default=None
+            If set, ``features`` must contain only training rows, the cache is
+            populated processing at most this many rows at a time, and None is
+            returned. Requires store_cache=True.
+
         Returns
         -------
-        Tensor
-            Embeddings of shape (..., T, E).
+        Optional[Tensor]
+            Embeddings of shape (..., T, E), or None if ``row_chunk_size`` is set.
         """
+        if row_chunk_size is not None:
+            assert store_cache and train_size == features.shape[-2], "Chunked cache storing needs only training rows."
+            src = None
+            for start in range(0, train_size, row_chunk_size):
+                end = min(start + row_chunk_size, train_size)
+                chunk = self.in_linear(features[..., start:end, :])
+                if self.target_aware:
+                    chunk = chunk + self._embed_labels(y_train[..., start:end])
+                if src is None:
+                    src = torch.empty((*features.shape[:-1], chunk.shape[-1]), dtype=chunk.dtype, device=chunk.device)
+                src[..., start:end, :] = chunk
+                del chunk
+            self.tf_col.store_cache_chunked(src, col_cache=col_cache, row_chunk_size=row_chunk_size)
+            return None
+
         src = self.in_linear(features)
 
         if not self.target_aware:
@@ -808,12 +835,8 @@ class ColEmbedding(nn.Module):
             # Test rows never get a label embedding: the training labels only reach
             # them through the cached K/V projections from the store_cache pass.
             if y_train is not None:
-                if self.max_classes > 0:
-                    y_emb = self.y_encoder(y_train.float())
-                else:
-                    y_emb = self.y_encoder(y_train.unsqueeze(-1))
                 n_labeled = y_train.shape[-1]
-                src[..., :n_labeled, :] = src[..., :n_labeled, :] + y_emb
+                src[..., :n_labeled, :] = src[..., :n_labeled, :] + self._embed_labels(y_train)
 
             src = self.tf_col.forward_with_cache(
                 src, col_cache=col_cache, train_size=train_size, use_cache=use_cache, store_cache=store_cache
@@ -837,6 +860,7 @@ class ColEmbedding(nn.Module):
         store_cache: bool = True,
         mgr_config: MgrConfig = None,
         discard_output: bool = False,
+        row_chunk_size: Optional[int] = None,
     ) -> Optional[Tensor]:
         """Transform input table into embeddings with KV caching support.
 
@@ -868,6 +892,12 @@ class ColEmbedding(nn.Module):
             If True, only populate ``col_cache`` and return None instead of
             gathering the embeddings.
 
+        row_chunk_size : Optional[int], default=None
+            If set, the cache is populated processing at most this many rows at
+            a time, which keeps the activations of the set transformer from
+            scaling with the number of training rows. Requires store_cache=True,
+            discard_output=True and ``X`` to contain only the training rows.
+
         Returns
         -------
         Optional[Tensor]
@@ -876,6 +906,9 @@ class ColEmbedding(nn.Module):
 
         if use_cache == store_cache:
             raise ValueError("Exactly one of use_cache or store_cache must be True")
+
+        if row_chunk_size is not None and not (store_cache and discard_output):
+            raise ValueError("row_chunk_size requires store_cache=True and discard_output=True")
 
         if store_cache:
             assert y_train is not None, "y_train must be provided when store_cache=True"
@@ -917,6 +950,7 @@ class ColEmbedding(nn.Module):
                     ("y_train", y_train),
                     ("use_cache", use_cache),
                     ("store_cache", store_cache),
+                    ("row_chunk_size", row_chunk_size),
                 ]
             ),
             discard_output=discard_output,

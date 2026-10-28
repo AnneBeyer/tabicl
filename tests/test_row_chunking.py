@@ -12,6 +12,8 @@ import torch
 
 from tabicl import TabICLClassifier
 from tabicl._model.embedding import ColEmbedding
+from tabicl._model.encoders import SetTransformer
+from tabicl._model.layers import MultiheadAttentionBlock
 from tabicl._model.inference_config import InferenceConfig
 from tabicl._model.kv_cache import KVCache
 from tabicl._model.tabicl import TabICL
@@ -69,6 +71,59 @@ def _force_multi_batch(model: TabICL, monkeypatch) -> None:
             "estimate_safe_batch_size",
             lambda seq_len, include_inputs=True, in_dim=None, max_bs=50000: (1.0, 1),
         )
+
+
+@pytest.mark.parametrize("norm_first", [True, False])
+@pytest.mark.parametrize("ssmax", ["none", "qassmax-mlp-elementwise"])
+@pytest.mark.parametrize("chunk_size", [1, 6, 50])
+def test_attention_block_chunked_kv(norm_first, ssmax, chunk_size):
+    """Attending to keys/values chunk by chunk with an online softmax is exact."""
+    torch.manual_seed(0)
+    block = MultiheadAttentionBlock(16, 2, 32, norm_first=norm_first, ssmax=ssmax, zero_init=False).eval()
+    q = torch.randn(3, 4, 8, 16)
+    kv = torch.randn(3, 4, 37, 16) * 3
+
+    with torch.no_grad():
+        expected = block(q, kv, kv)
+        out = block.forward_chunked_kv(q, kv, chunk_size=chunk_size)
+
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, TRAIN_SIZE])
+def test_set_transformer_chunked_cache_storing(chunk_size):
+    """The chunked cache-only pass stores the same K/V as the regular store pass."""
+    torch.manual_seed(0)
+    tf = SetTransformer(num_blocks=3, d_model=16, nhead=2, dim_feedforward=32, num_inds=8, ssmax=True, zero_init=False)
+    tf.eval()
+    src = torch.randn(2, 5, TRAIN_SIZE, 16)
+    src[:, 0] = -100.0  # fully skipped columns, e.g. reserved CLS slots
+
+    expected, cache = KVCache(), KVCache()
+    with torch.no_grad():
+        tf.forward_with_cache(src, col_cache=expected, train_size=TRAIN_SIZE, store_cache=True, use_cache=False)
+        tf.store_cache_chunked(src.clone(), col_cache=cache, row_chunk_size=chunk_size)
+
+    assert cache.kv.keys() == expected.kv.keys()
+    for idx in expected.kv:
+        torch.testing.assert_close(cache.kv[idx].key, expected.kv[idx].key)
+        torch.testing.assert_close(cache.kv[idx].value, expected.kv[idx].value)
+
+
+def test_inference_forward_chunked_amp():
+    """Chunked inference runs under autocast and stays close to the unchunked result."""
+    model = _make_model()
+    X, y_train = _make_data()
+    config, chunked_config = _config("cpu"), _config("cpu", 7)
+    for c in (config, chunked_config):
+        for mgr in (c.COL_CONFIG, c.ROW_CONFIG, c.ICL_CONFIG):
+            mgr.update({"use_amp": True})
+
+    with torch.no_grad():
+        expected = model(X, y_train, inference_config=config)
+        out = model(X, y_train, inference_config=chunked_config)
+
+    torch.testing.assert_close(out.float(), expected.float(), atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize("device", DEVICES)

@@ -256,8 +256,13 @@ class InferenceConfig:
         on at most this many rows at a time. The column embeddings of shape
         (B, T, H+C, E) are by far the largest intermediate tensor; chunking
         only ever materializes them for ``ROW_CHUNK_SIZE`` rows, and keeps the
-        much smaller row representations (B, T, C*E) for the whole table.
-        Predictions are unchanged up to floating-point noise. Chunking is
+        much smaller row representations (B, T, C*E) for the whole table. The
+        pass over the training rows that lets the inducing points of the
+        column-wise set transformer attend to them is chunked as well, keeping
+        a single (B, H+C, train_size, E) activation. Its attention scores take
+        ``nhead * num_inds`` values per row and column, so a few hundred rows
+        is usually a good choice. Predictions are unchanged up to
+        floating-point noise. Chunking is
         skipped when ``embed_with_test=True`` and for classification with more
         classes than the model supports, as neither can embed rows
         independently. If None, all rows are processed at once.

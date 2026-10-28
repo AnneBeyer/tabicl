@@ -401,3 +401,30 @@ class SetTransformer(nn.Module):
             out = block.forward_with_cache(out, col_cache, block_idx, train_size, use_cache, store_cache)
 
         return out
+
+    def store_cache_chunked(self, src: Tensor, col_cache: KVCache, row_chunk_size: int) -> None:
+        """Populate the cache from training rows only, a chunk of rows at a time.
+
+        Equivalent to ``forward_with_cache(src, col_cache, train_size=src.shape[-2],
+        store_cache=True)`` with the output discarded, but only ``src`` is kept
+        for all rows (and overwritten with the block outputs), see
+        ``InducedSelfAttentionBlock.store_cache_chunked``. The second attention
+        stage of the last block is skipped, as its output is not needed.
+
+        Parameters
+        ----------
+        src : Tensor
+            Training rows of shape (..., train_size, d_model). Overwritten.
+
+        col_cache : KVCache
+            Cache object for storing K/V projections of ``hidden``.
+
+        row_chunk_size : int
+            Maximum number of rows processed at once.
+        """
+        out = src
+        last_idx = len(self.blocks) - 1
+        for block_idx, block in enumerate(self.blocks):
+            out = block.store_cache_chunked(
+                out, col_cache, block_idx, row_chunk_size, need_output=block_idx < last_idx
+            )

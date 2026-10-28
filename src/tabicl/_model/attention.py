@@ -306,3 +306,97 @@ def multi_head_attention_forward(
         return attn_output, k, v
 
     return attn_output
+
+
+def chunked_kv_attention_forward(
+    query: Tensor,
+    key_value: Tensor,
+    num_heads: int,
+    in_proj_weight: Tensor,
+    in_proj_bias: Optional[Tensor],
+    out_proj_weight: Tensor,
+    out_proj_bias: Optional[Tensor],
+    chunk_size: int,
+    kv_norm: Optional[nn.Module] = None,
+    ssmax_layer: Optional[nn.Module] = None,
+) -> Tensor:
+    """Multi-head attention over a long key/value sequence, a chunk at a time.
+
+    Equivalent to ``multi_head_attention_forward(query, key=kv, value=kv)`` in
+    eval mode without masks or RoPE, where ``kv = kv_norm(key_value)``, but
+    keys and values are projected and attended to ``chunk_size`` positions at
+    a time with an online softmax. Memory thus scales with ``chunk_size``
+    instead of ``src_len``, apart from ``key_value`` itself. The softmax is
+    accumulated in float32.
+
+    Parameters
+    ----------
+    query : Tensor
+        Query tensor of shape (..., tgt_len, embed_dim).
+
+    key_value : Tensor
+        Key and value tensor of shape (..., src_len, embed_dim).
+
+    num_heads : int
+        Number of attention heads.
+
+    in_proj_weight, in_proj_bias : Tensor
+        Packed Q, K, V input projection.
+
+    out_proj_weight, out_proj_bias : Tensor
+        Output projection.
+
+    chunk_size : int
+        Number of key/value positions processed at once.
+
+    kv_norm : Optional[nn.Module], default=None
+        Normalization applied to each chunk of ``key_value`` before projection.
+
+    ssmax_layer : Optional[nn.Module], default=None
+        If provided, applies scalable softmax (SSMax) scaling to queries, with
+        ``src_len`` as the sequence length.
+
+    Returns
+    -------
+    Tensor
+        Attention output of shape (..., tgt_len, embed_dim).
+    """
+    *batch_shape, tgt_len, embed_dim = query.shape
+    src_len = key_value.shape[-2]
+    head_dim = embed_dim // num_heads
+    w_q, w_k, w_v = in_proj_weight.chunk(3)
+    b_q, b_k, b_v = in_proj_bias.chunk(3) if in_proj_bias is not None else (None, None, None)
+
+    def split_heads(x: Tensor) -> Tensor:
+        return x.view(*x.shape[:-1], num_heads, head_dim).transpose(-3, -2)
+
+    q = split_heads(F.linear(query, w_q, b_q))  # (..., nh, tgt_len, hs)
+    if ssmax_layer is not None:
+        q = ssmax_layer(q.reshape(-1, *q.shape[-3:]), src_len).view(q.shape)
+    out_dtype = q.dtype
+    q = q.float() * head_dim**-0.5
+
+    running_max = q.new_full((*q.shape[:-1], 1), float("-inf"))
+    running_sum = q.new_zeros((*q.shape[:-1], 1))
+    acc = torch.zeros_like(q)
+    for start in range(0, src_len, chunk_size):
+        # Normalization and projections run under the caller's autocast settings,
+        # only the softmax accumulation is forced to float32
+        kv = key_value[..., start : start + chunk_size, :]
+        if kv_norm is not None:
+            kv = kv_norm(kv)
+        k = split_heads(F.linear(kv, w_k, b_k))
+        v = split_heads(F.linear(kv, w_v, b_v))
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            scores = q @ k.float().transpose(-2, -1)  # (..., nh, tgt_len, chunk)
+            new_max = torch.maximum(running_max, scores.amax(dim=-1, keepdim=True))
+            weights = torch.exp(scores - new_max)
+            rescale = torch.exp(running_max - new_max)
+            running_sum = running_sum * rescale + weights.sum(dim=-1, keepdim=True)
+            acc = acc * rescale + weights @ v.float()
+            running_max = new_max
+        del kv, k, v, scores, weights
+
+    attn_output = (acc / running_sum).to(out_dtype)
+    attn_output = attn_output.transpose(-3, -2).reshape(*batch_shape, tgt_len, embed_dim)
+    return F.linear(attn_output, out_proj_weight, out_proj_bias)
