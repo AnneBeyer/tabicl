@@ -1237,7 +1237,8 @@ class InferenceManager:
         inputs: OrderedDict[str, Any],
         auto_batch: bool = True,
         output_repeat: int = 1,
-    ) -> Tensor:
+        discard_output: bool = False,
+    ) -> Optional[Tensor]:
         """Execute forward pass with automatic batching and memory management.
 
         This method runs the provided forward function on the inputs, automatically
@@ -1265,11 +1266,18 @@ class InferenceManager:
             the output will be manipulated to create multiple derived outputs in
             subsequent operations (e.g. shuffled multiple times for feature ordering).
 
+        discard_output : bool, default=False
+            If True, the per-batch outputs are dropped instead of being gathered
+            and ``None`` is returned. This is useful when ``forward_fn`` is only
+            run for its side effects, e.g. populating a store-mode ``KVCache``
+            input, and avoids allocating (or offloading) the full output buffer.
+
         Returns
         -------
-        Tensor
-            Combined output tensor from all batches. The tensor will be on the
-            device determined by the offload mode:
+        Optional[Tensor]
+            Combined output tensor from all batches, or ``None`` if
+            ``discard_output=True``. The tensor will be on the device determined
+            by the offload mode:
 
             - GPU mode: Returns GPU tensor
             - CPU mode: Returns CPU tensor (pinned or non-pinned)
@@ -1290,12 +1298,14 @@ class InferenceManager:
 
         # Non-batched execution
         if not auto_batch:
-            return self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            out = self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            return None if discard_output else out
 
         # CPU: no accelerator memory APIs for safe batch sizing; still route
         # through _run_forward so AMP/no_grad wrapping stays consistent.
         if self.exe_device.type == "cpu":
-            return self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            out = self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            return None if discard_output else out
 
         # Extract shape/dtype info
         first_value = next(iter(inputs.values()))
@@ -1318,34 +1328,40 @@ class InferenceManager:
                 f"estimated batch size for {self.enc_name}: {batch_size}"
             )
 
-        # Calculate output shape
-        if self.out_no_seq:
-            output_shape = (*batch_dims, self.out_dim)
+        if discard_output:
+            # Nothing is gathered, so there is no output buffer to place.
+            mode = OffloadMode.GPU
         else:
-            output_shape = (*batch_dims, seq_len, self.out_dim)
+            # Calculate output shape
+            if self.out_no_seq:
+                output_shape = (*batch_dims, self.out_dim)
+            else:
+                output_shape = (*batch_dims, seq_len, self.out_dim)
 
-        # Estimate output size
-        output_mb = self._estimate_tensor_mb(tuple(output_shape), input_dtype, repeat=output_repeat)
-        cpu_free = self.get_available_cpu_memory()
-        disk_free = self.get_available_disk_space(self.disk_offload_dir)
+            # Estimate output size
+            output_mb = self._estimate_tensor_mb(tuple(output_shape), input_dtype, repeat=output_repeat)
+            cpu_free = self.get_available_cpu_memory()
+            disk_free = self.get_available_disk_space(self.disk_offload_dir)
 
-        # Resolve offload mode
-        mode, reason = self._resolve_offload_mode(output_mb, gpu_mem, cpu_free, disk_free)
+            # Resolve offload mode
+            mode, reason = self._resolve_offload_mode(output_mb, gpu_mem, cpu_free, disk_free)
 
-        if self.verbose:
-            eff_disk = max(0, disk_free - self.disk_min_free_mb)
-            print(
-                f"Offload decision: mode={mode.name} (reason={reason})\n"
-                f"Output size: {output_mb / 1024:.2f}GB (repeat={output_repeat}), "
-                f"CPU free: {cpu_free / 1024:.2f}GB, "
-                f"GPU free: {gpu_mem / 1024:.2f}GB, "
-                f"Disk free (effective): {eff_disk / 1024:.2f}GB @ {self.disk_offload_dir}"
-            )
+            if self.verbose:
+                eff_disk = max(0, disk_free - self.disk_min_free_mb)
+                print(
+                    f"Offload decision: mode={mode.name} (reason={reason})\n"
+                    f"Output size: {output_mb / 1024:.2f}GB (repeat={output_repeat}), "
+                    f"CPU free: {cpu_free / 1024:.2f}GB, "
+                    f"GPU free: {gpu_mem / 1024:.2f}GB, "
+                    f"Disk free (effective): {eff_disk / 1024:.2f}GB @ {self.disk_offload_dir}"
+                )
 
         # Single batch case
         if batch_size >= total_bs:
             out = self._run_forward(forward_fn, self._prepare_inputs(inputs))
 
+            if discard_output:
+                return None
             if mode == OffloadMode.GPU:
                 return out
             if mode == OffloadMode.CPU:
@@ -1360,7 +1376,9 @@ class InferenceManager:
             return outputs
 
         # Multi-batch execution
-        outputs, _ = self._allocate_output_buffer(mode, tuple(output_shape), input_dtype)
+        outputs = None
+        if not discard_output:
+            outputs, _ = self._allocate_output_buffer(mode, tuple(output_shape), input_dtype)
 
         # Setup async copy manager if using async and offloading
         async_copy: Optional[AsyncCopyManager] = None
@@ -1406,6 +1424,10 @@ class InferenceManager:
                                 # pre-allocate zero tensors with the full batch dimensions.
                                 original_cache.preallocate(batch_cache, tuple(batch_dims), device=self.exe_device)
                             original_cache[indices] = batch_cache
+
+                    if discard_output:
+                        del out, batch_dict
+                        continue
 
                     if mode == OffloadMode.GPU:
                         outputs[indices] = out

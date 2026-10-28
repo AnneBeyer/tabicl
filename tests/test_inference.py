@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from tabicl._model.inference import AsyncCopyManager, InferenceManager, devices_match
+from tabicl._model.kv_cache import KVCache, KVCacheEntry
 
 
 @pytest.mark.parametrize(
@@ -197,6 +198,37 @@ def test_cpu_path_uses_run_forward():
     out = mgr(forward_fn, OrderedDict([("features", features)]))
     assert called["run_forward"] == 1
     assert out.shape == (2, 3, 5, 4)
+
+
+@pytest.mark.parametrize("device_backend", ["cpu", "cuda", "xpu", "mps"])
+def test_discard_output_keeps_cache_side_effects(device_backend, monkeypatch):
+    """``discard_output=True`` returns None but still fills store-mode caches."""
+    if device_backend != "cpu" and not getattr(torch, device_backend).is_available():
+        pytest.skip(f"{device_backend} backend is not available on this host")
+
+    mgr = InferenceManager(enc_name="tf_col", out_dim=4)
+    mgr.configure(device=device_backend, use_amp=False, use_fa3=False, use_async=False, offload="gpu")
+    # Force a tiny safe batch so accelerators take the multi-batch path.
+    monkeypatch.setattr(
+        mgr,
+        "estimate_safe_batch_size",
+        lambda seq_len, include_inputs=True, in_dim=None, max_bs=50000: (1.0, 1),
+    )
+
+    features = torch.randn(2, 3, 5, 1)
+
+    def forward_fn(features, cache):
+        # K/V entries are laid out as (*batch, num_heads, seq_len, head_dim).
+        kv = features.unsqueeze(-3)
+        cache.kv[0] = KVCacheEntry(key=kv * 2, value=kv * 3)
+        return torch.zeros(*features.shape[:-1], 4, device=features.device, dtype=features.dtype)
+
+    cache = KVCache()
+    out = mgr(forward_fn, OrderedDict([("features", features), ("cache", cache)]), discard_output=True)
+
+    assert out is None
+    torch.testing.assert_close(cache.kv[0].key.cpu(), features.unsqueeze(-3) * 2)
+    torch.testing.assert_close(cache.kv[0].value.cpu(), features.unsqueeze(-3) * 3)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
