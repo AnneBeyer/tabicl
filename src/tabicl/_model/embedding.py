@@ -756,8 +756,11 @@ class ColEmbedding(nn.Module):
             Position to split the input into training and test data.
 
         y_train : Optional[Tensor], default=None
-            Target values of shape (..., train_size). Required when
-            store_cache=True and target_aware=True; ignored when use_cache=True.
+            Target values of shape (..., n_labeled) for the leading ``n_labeled``
+            rows of ``features``. Required when store_cache=True and
+            target_aware=True. With use_cache=True, it is only needed when
+            ``features`` starts with training rows, e.g. when embedding the
+            table in row chunks.
 
         use_cache : bool, default=False
             Whether to use cached values to avoid redundant computation.
@@ -777,16 +780,18 @@ class ColEmbedding(nn.Module):
                 src, col_cache=col_cache, train_size=train_size, use_cache=use_cache, store_cache=store_cache
             )
         else:
-            # When using cache, skip y_train embedding — it's already baked
-            # into the cached K/V projections from the store_cache pass.
             if store_cache:
                 assert y_train is not None, "y_train must be provided when target_aware=True and store_cache=True."
 
+            # Test rows never get a label embedding: the training labels only reach
+            # them through the cached K/V projections from the store_cache pass.
+            if y_train is not None:
                 if self.max_classes > 0:
                     y_emb = self.y_encoder(y_train.float())
                 else:
                     y_emb = self.y_encoder(y_train.unsqueeze(-1))
-                src[..., :train_size, :] = src[..., :train_size, :] + y_emb
+                n_labeled = y_train.shape[-1]
+                src[..., :n_labeled, :] = src[..., :n_labeled, :] + y_emb
 
             src = self.tf_col.forward_with_cache(
                 src, col_cache=col_cache, train_size=train_size, use_cache=use_cache, store_cache=store_cache
@@ -809,7 +814,8 @@ class ColEmbedding(nn.Module):
         use_cache: bool = False,
         store_cache: bool = True,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        discard_output: bool = False,
+    ) -> Optional[Tensor]:
         """Transform input table into embeddings with KV caching support.
 
         Parameters
@@ -821,8 +827,10 @@ class ColEmbedding(nn.Module):
             Cache object for storing/retrieving ISAB K/V projections.
 
         y_train : Optional[Tensor], default=None
-            Target values for training samples of shape (B, train_size).
-            Required when store_cache=True; ignored when use_cache=True.
+            Target values for the leading training rows of ``X``, of shape
+            (B, n_labeled). Required when store_cache=True, where all training
+            rows must be labeled. With use_cache=True, only needed when ``X``
+            starts with training rows (e.g. a row chunk of the full table).
 
         use_cache : bool, default=False
             Whether to use cached values to avoid redundant computation.
@@ -834,10 +842,14 @@ class ColEmbedding(nn.Module):
             Configuration for InferenceManager. If None, uses the default
             COL_CONFIG from InferenceConfig.
 
+        discard_output : bool, default=False
+            If True, only populate ``col_cache`` and return None instead of
+            gathering the embeddings.
+
         Returns
         -------
-        Tensor
-            Embeddings of shape (B, T, G+C, E).
+        Optional[Tensor]
+            Embeddings of shape (B, T, G+C, E), or None if ``discard_output=True``.
         """
 
         if use_cache == store_cache:
@@ -869,12 +881,9 @@ class ColEmbedding(nn.Module):
                 X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
             features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
 
-        if store_cache:
-            train_size = y_train.shape[1]
+        train_size = y_train.shape[1] if store_cache else None
+        if y_train is not None:
             y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
-        else:
-            train_size = None
-            y_train = None
 
         embeddings = self.inference_mgr(
             self._compute_embeddings_with_cache,
@@ -888,5 +897,8 @@ class ColEmbedding(nn.Module):
                     ("store_cache", store_cache),
                 ]
             ),
+            discard_output=discard_output,
         )
+        if discard_output:
+            return None
         return embeddings.transpose(1, 2)
