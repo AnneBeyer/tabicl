@@ -142,7 +142,7 @@ def test_col_embedding_cached_chunks_with_labels(device, target_aware, monkeypat
         max_classes=4,
         reserve_cls_tokens=2,
         zero_init=False,
-    ).eval()
+    ).to(device).eval()
     monkeypatch.setattr(
         embedder.inference_mgr,
         "estimate_safe_batch_size",
@@ -200,7 +200,7 @@ def test_col_embedding_cached_chunks_with_labels(device, target_aware, monkeypat
 def test_inference_forward_chunked(device, row_chunk_size, max_classes, num_classes, feature_group, monkeypatch):
     """Chunking the rows does not change the predictions of the regular forward pass."""
     skip_if_device_unusable(device)
-    model = _make_model(max_classes=max_classes, feature_group=feature_group)
+    model = _make_model(max_classes=max_classes, feature_group=feature_group).to(device)
     _force_multi_batch(model, monkeypatch)
     X, y_train = _make_data(num_classes=num_classes)
 
@@ -215,7 +215,7 @@ def test_inference_forward_chunked(device, row_chunk_size, max_classes, num_clas
 def test_inference_forward_chunked_feature_shuffles(device, monkeypatch):
     """The shuffle optimization (embed one table, permute for the others) still applies."""
     skip_if_device_unusable(device)
-    model = _make_model(feature_group=False)
+    model = _make_model(feature_group=False).to(device)
     _force_multi_batch(model, monkeypatch)
     X, y_train = _make_data(B=1)
     shuffles = [[0, 1, 2, 3, 4], [4, 2, 0, 1, 3], [1, 0, 3, 4, 2]]
@@ -253,9 +253,10 @@ def test_inference_forward_unchunkable_falls_back(max_classes, num_classes, embe
 def test_forward_with_cache_chunked(device, cache_mode, max_classes, num_classes, monkeypatch):
     """Storing and using a cache in row chunks matches the unchunked cached passes."""
     skip_if_device_unusable(device)
-    model = _make_model(max_classes=max_classes)
+    model = _make_model(max_classes=max_classes).to(device)
     _force_multi_batch(model, monkeypatch)
-    X, y_train = _make_data(num_classes=num_classes)
+    # The repr cache adds the label embedding of y_train as is, so the inputs must already be on the device.
+    X, y_train = (t.to(device) for t in _make_data(num_classes=num_classes))
     X_train, X_test = X[:, :TRAIN_SIZE], X[:, TRAIN_SIZE:]
 
     def run(row_chunk_size):
