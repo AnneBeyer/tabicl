@@ -231,6 +231,25 @@ def test_discard_output_keeps_cache_side_effects(device_backend, monkeypatch):
     torch.testing.assert_close(cache.kv[0].value.cpu(), features.unsqueeze(-3) * 3)
 
 
+@pytest.mark.parametrize("device_backend", ["cpu", "cuda", "xpu", "mps"])
+@pytest.mark.parametrize("offload", ["gpu", "cpu", "disk"])
+def test_allocate_output_follows_offload_mode(device_backend, offload, tmp_path):
+    """``allocate_output`` stores the output where the offload mode resolved for its size puts it."""
+    if device_backend != "cpu" and not getattr(torch, device_backend).is_available():
+        pytest.skip(f"{device_backend} backend is not available on this host")
+
+    mgr = InferenceManager(enc_name="tf_row", out_dim=4)
+    mgr.configure(device=device_backend, offload=offload, disk_offload_dir=str(tmp_path), disk_cleanup=False)
+
+    out = mgr.allocate_output((2, 3, 4), torch.float32)
+
+    # As in __call__, outputs of CPU execution are never offloaded
+    offloaded = device_backend != "cpu" and offload != "gpu"
+    assert out.shape == (2, 3, 4) and out.dtype == torch.float32
+    assert out.device.type == ("cpu" if offloaded else device_backend)
+    assert len(list(tmp_path.iterdir())) == int(device_backend != "cpu" and offload == "disk")
+
+
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
 def test_mps_path_uses_run_forward_and_amp():
     """MPS must not take the old CPU-like early return; AMP should engage."""

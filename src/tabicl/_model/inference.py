@@ -1125,6 +1125,28 @@ class InferenceManager:
         else:
             return OffloadMode.CPU, OffloadReason("auto_cpu_swap", "gpu tight, cpu tight, disk tight -> cpu (swap)")
 
+    def _resolve_output_offload_mode(
+        self, output_shape: Tuple[int, ...], dtype: torch.dtype, gpu_free_mb: float, output_repeat: int = 1
+    ) -> OffloadMode:
+        """Resolve where an output of the given shape is stored, see ``_resolve_offload_mode``."""
+        output_mb = self._estimate_tensor_mb(output_shape, dtype, repeat=output_repeat)
+        cpu_free = self.get_available_cpu_memory()
+        disk_free = self.get_available_disk_space(self.disk_offload_dir)
+
+        mode, reason = self._resolve_offload_mode(output_mb, gpu_free_mb, cpu_free, disk_free)
+
+        if self.verbose:
+            eff_disk = max(0, disk_free - self.disk_min_free_mb)
+            print(
+                f"Offload decision: mode={mode.name} (reason={reason})\n"
+                f"Output size: {output_mb / 1024:.2f}GB (repeat={output_repeat}), "
+                f"CPU free: {cpu_free / 1024:.2f}GB, "
+                f"GPU free: {gpu_free_mb / 1024:.2f}GB, "
+                f"Disk free (effective): {eff_disk / 1024:.2f}GB @ {self.disk_offload_dir}"
+            )
+
+        return mode
+
     def _allocate_output_buffer(
         self,
         mode: OffloadMode,
@@ -1186,6 +1208,40 @@ class InferenceManager:
 
         info.update({"path": path, "storage_dtype": str(storage_dtype)})
         return disk_tensor, info
+
+    def allocate_output(self, shape: Tuple[int, ...], dtype: torch.dtype) -> Tensor:
+        """Allocate an output tensor where the offload mode stores an output of this size.
+
+        ``__call__`` decides where to store its output based on the output's size.
+        A caller that assembles one output from several calls, e.g. one per chunk
+        of rows, can allocate the full output with this method instead, so that
+        the decision is made once for the full size rather than for each part.
+
+        Parameters
+        ----------
+        shape : Tuple[int, ...]
+            Shape of the output.
+
+        dtype : torch.dtype
+            Data type of the output.
+
+        Returns
+        -------
+        Tensor
+            Uninitialized tensor on the execution device, in CPU memory, or backed
+            by a memory-mapped file. As in ``__call__``, outputs of CPU execution
+            are not offloaded and always stay in memory.
+        """
+        if not self._is_configured:
+            raise RuntimeError("InferenceManager must be configured before allocating outputs. Call configure() first.")
+
+        shape = tuple(shape)
+        if self.exe_device.type == "cpu":
+            return torch.empty(shape, dtype=dtype)
+
+        mode = self._resolve_output_offload_mode(shape, dtype, self.get_available_gpu_memory())
+        out, _ = self._allocate_output_buffer(mode, shape, dtype)
+        return out.tensor if isinstance(out, DiskTensor) else out
 
     def _to_exe_device(self, tensor: Tensor) -> Tensor:
         """Move tensor to execution device if not already there.
@@ -1338,23 +1394,7 @@ class InferenceManager:
             else:
                 output_shape = (*batch_dims, seq_len, self.out_dim)
 
-            # Estimate output size
-            output_mb = self._estimate_tensor_mb(tuple(output_shape), input_dtype, repeat=output_repeat)
-            cpu_free = self.get_available_cpu_memory()
-            disk_free = self.get_available_disk_space(self.disk_offload_dir)
-
-            # Resolve offload mode
-            mode, reason = self._resolve_offload_mode(output_mb, gpu_mem, cpu_free, disk_free)
-
-            if self.verbose:
-                eff_disk = max(0, disk_free - self.disk_min_free_mb)
-                print(
-                    f"Offload decision: mode={mode.name} (reason={reason})\n"
-                    f"Output size: {output_mb / 1024:.2f}GB (repeat={output_repeat}), "
-                    f"CPU free: {cpu_free / 1024:.2f}GB, "
-                    f"GPU free: {gpu_mem / 1024:.2f}GB, "
-                    f"Disk free (effective): {eff_disk / 1024:.2f}GB @ {self.disk_offload_dir}"
-                )
+            mode = self._resolve_output_offload_mode(tuple(output_shape), input_dtype, gpu_mem, output_repeat)
 
         # Single batch case
         if batch_size >= total_bs:
