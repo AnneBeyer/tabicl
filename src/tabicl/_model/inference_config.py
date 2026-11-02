@@ -256,7 +256,9 @@ class InferenceConfig:
         on at most this many rows at a time. The column embeddings of shape
         (B, T, H+C, E) are by far the largest intermediate tensor; chunking
         only ever materializes them for ``ROW_CHUNK_SIZE`` rows, and keeps the
-        much smaller row representations (B, T, C*E) for the whole table. The
+        much smaller row representations (B, T, C*E) for the whole table. As
+        without chunking, the offload settings of ``ROW_CONFIG`` decide where
+        those are stored. The
         pass over the training rows that lets the inducing points of the
         column-wise set transformer attend to them is chunked as well, keeping
         a single (B, H+C, train_size, E) activation. Its attention scores take

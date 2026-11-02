@@ -252,6 +252,37 @@ class RowInteraction(nn.Module):
 
         return representations  # (B, T, C*E)
 
+    def allocate_representations(self, B: int, T: int, dtype: torch.dtype, mgr_config: MgrConfig = None) -> Tensor:
+        """Allocate row representations to be filled by several inference calls.
+
+        The offload mode of ``mgr_config`` decides where they are stored for the
+        size of all T rows, as it does for a single inference call on all rows.
+
+        Parameters
+        ----------
+        B : int
+            Number of tables.
+
+        T : int
+            Number of rows.
+
+        dtype : torch.dtype
+            Data type of the representations.
+
+        mgr_config : MgrConfig, default=None
+            Configuration for InferenceManager.
+
+        Returns
+        -------
+        Tensor
+            Uninitialized row representations of shape (B, T, C*E).
+        """
+        if mgr_config is None:
+            mgr_config = InferenceConfig().ROW_CONFIG
+        self.inference_mgr.configure(**mgr_config)
+
+        return self.inference_mgr.allocate_output((B, T, self.num_cls * self.embed_dim), dtype)
+
     def forward(self, embeddings: Tensor, d: Optional[Tensor] = None, mgr_config: MgrConfig = None) -> Tensor:
         """Transform feature embeddings into row representations.
 

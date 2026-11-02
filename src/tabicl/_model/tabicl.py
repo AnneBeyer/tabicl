@@ -9,7 +9,7 @@ from .interaction import RowInteraction
 from .learning import ICLearning
 from .quantile_dist import QuantileToDistribution
 from .kv_cache import KVCache, TabICLCache
-from .inference_config import InferenceConfig
+from .inference_config import InferenceConfig, MgrConfig
 
 
 class TabICL(nn.Module):
@@ -376,7 +376,8 @@ class TabICL(nn.Module):
         inducing points attend to the training rows with an online softmax). The
         column embeddings of shape (B, T, H+C, E) then only ever exist for
         ``row_chunk_size`` rows, and only the row representations (B, T, C*E)
-        are kept for all rows.
+        are kept for all rows. As in the unchunked forward pass, the offload
+        settings of ``ROW_CONFIG`` decide once where those are stored.
 
         Parameters
         ----------
@@ -435,7 +436,11 @@ class TabICL(nn.Module):
                 row_chunk_size=row_chunk_size,
             )
 
-        representations = []
+        # The offload mode of ROW_CONFIG is resolved once for the representations
+        # of all rows, so the representations of each chunk stay on the execution
+        # device until they are copied there.
+        chunk_config = MgrConfig(**inference_config.ROW_CONFIG).update({"offload": "gpu"})
+        representations = None
         for start in range(0, T, row_chunk_size):
             end = min(start + row_chunk_size, T)
             # Training rows in the chunk get their label embedding, as in the unchunked forward pass
@@ -451,10 +456,17 @@ class TabICL(nn.Module):
             if feature_shuffles is not None:
                 embeddings = self.col_embedder.apply_feature_shuffles(embeddings[0].transpose(0, 1), feature_shuffles)
                 embeddings = embeddings.transpose(1, 2)  # (B, chunk, H+C, E)
-            representations.append(self.row_interactor(embeddings, mgr_config=inference_config.ROW_CONFIG))
+            chunk_repr = self.row_interactor(embeddings, mgr_config=chunk_config)  # (B, chunk, C*E)
             del embeddings
 
-        return torch.cat(representations, dim=1)
+            if representations is None:
+                representations = self.row_interactor.allocate_representations(
+                    chunk_repr.shape[0], T, chunk_repr.dtype, mgr_config=inference_config.ROW_CONFIG
+                )
+            representations[:, start:end] = chunk_repr
+            del chunk_repr
+
+        return representations
 
     def _can_chunk_rows(self, y_train: Tensor, embed_with_test: bool = False) -> bool:
         """Whether the column-wise embedding is row-separable for this input.

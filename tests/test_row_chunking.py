@@ -294,6 +294,58 @@ def test_chunked_column_embeddings_stay_small(monkeypatch):
     assert max(seen_rows) == 7
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("offload", ["gpu", "cpu", "disk"])
+def test_chunked_row_representations_are_placed_once(device, offload, tmp_path, monkeypatch):
+    """The offload settings of ROW_CONFIG place the representations of all rows, not of each chunk."""
+    skip_if_device_unusable(device)
+    model = _make_model().to(device)
+    _force_multi_batch(model, monkeypatch)
+    X, y_train = _make_data()
+    config = _config(device, row_chunk_size=7)
+    config.ROW_CONFIG.update({"offload": offload, "disk_offload_dir": str(tmp_path), "disk_cleanup": False})
+
+    with torch.no_grad():
+        embeddings = model.col_embedder(X, y_train=y_train, mgr_config=config.COL_CONFIG)
+        expected = model.row_interactor(embeddings, mgr_config=_config(device).ROW_CONFIG)
+        representations = model._embed_rows_chunked(
+            X, col_cache=KVCache(), row_chunk_size=7, y_train=y_train, inference_config=config
+        )
+
+    # Outputs of CPU execution are never offloaded
+    offloaded = device != "cpu" and offload != "gpu"
+    assert representations.device.type == ("cpu" if offloaded else device)
+    # A single memory-mapped file holds all rows, rather than one per chunk
+    assert len(list(tmp_path.iterdir())) == int(device != "cpu" and offload == "disk")
+    assert config.ROW_CONFIG.offload == offload
+    torch.testing.assert_close(representations.cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("device", [d for d in DEVICES if d != "cpu"])
+def test_chunked_auto_offload_sees_all_rows(device, monkeypatch):
+    """offload="auto" decides from the size of the representations of all rows, not of a chunk."""
+    skip_if_device_unusable(device)
+    model = _make_model().to(device)
+    X, y_train = _make_data()
+    config = _config(device, row_chunk_size=7)
+    config.ROW_CONFIG.update({"offload": "auto"})
+    # As much free device memory as the representations of all rows take: above the
+    # auto threshold for all rows (half of it), below it for a chunk of 7 rows.
+    row_interactor = model.row_interactor
+    all_rows_mb = X.shape[0] * X.shape[1] * row_interactor.num_cls * row_interactor.embed_dim * 4 / 2**20
+    monkeypatch.setattr(row_interactor.inference_mgr, "get_available_gpu_memory", lambda: all_rows_mb)
+
+    with torch.no_grad():
+        representations = model._embed_rows_chunked(
+            X, col_cache=KVCache(), row_chunk_size=7, y_train=y_train, inference_config=config
+        )
+        expected = model(X, y_train, inference_config=_config(device))
+        out = model(X, y_train, inference_config=config)
+
+    assert representations.device.type == "cpu"
+    torch.testing.assert_close(out.cpu(), expected.cpu())
+
+
 def test_row_chunk_size_validation():
     with pytest.raises(ValueError, match="ROW_CHUNK_SIZE"):
         InferenceConfig(ROW_CHUNK_SIZE=0)
