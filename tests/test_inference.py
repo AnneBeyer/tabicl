@@ -389,3 +389,17 @@ def test_cpu_output_not_pinned_on_integrated_gpu(monkeypatch):
 
     out, _ = mgr._allocate_output_buffer(OffloadMode.CPU, (2, 3), torch.float32)
     assert not out.is_pinned()
+
+
+def test_output_too_large_on_integrated_gpu_suggests_disk_offload(monkeypatch):
+    """Without disk offload, an output that does not fit on an integrated GPU raises with a hint."""
+    mgr = InferenceManager(enc_name="tf_col", out_dim=4)
+    mgr.configure(device="xpu", use_amp=False, use_fa3=False)
+    monkeypatch.setattr(mgr, "_uses_unified_host_memory", lambda: True)
+
+    def out_of_memory(*args, **kwargs):
+        raise RuntimeError("simulated out of memory")
+
+    monkeypatch.setattr(torch, "empty", out_of_memory)
+    with pytest.raises(RuntimeError, match="disk_offload_dir"):
+        mgr._allocate_output_buffer(OffloadMode.GPU, (2, 3), torch.float32)

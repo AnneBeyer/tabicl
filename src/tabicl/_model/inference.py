@@ -814,6 +814,15 @@ class InferenceManager:
         """Return whether the execution device allocates from host RAM, or None if unknown."""
         return device_uses_unified_host_memory(self.exe_device)
 
+    def _out_of_memory_hint(self) -> str:
+        """Suggestions to append to out-of-memory errors on devices that allocate from host RAM."""
+        if self._uses_unified_host_memory() is not True:
+            return ""
+        return (
+            " This device allocates from host RAM: close other applications, set `disk_offload_dir` "
+            "on the estimator to store outputs on disk, or lower its `batch_size`."
+        )
+
     @staticmethod
     def _host_memory_reserve_mb() -> float:
         """Host RAM (MB) left free for the rest of the system when the device shares it."""
@@ -1211,7 +1220,10 @@ class InferenceManager:
                     # CPU memory is the same RAM on integrated GPUs and MPS.
                     mode = OffloadMode.DISK
                 else:
-                    raise
+                    raise RuntimeError(
+                        f"Not enough memory for the {output_mb:.0f} MB {self.enc_name} output."
+                        + self._out_of_memory_hint()
+                    ) from e
 
         if mode == OffloadMode.CPU:
             try:
@@ -1451,6 +1463,7 @@ class InferenceManager:
             if total_bs <= self.min_batch_size:
                 raise RuntimeError(
                     f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {oom_error}"
+                    + self._out_of_memory_hint()
                 )
             for cache_key in store_cache_keys:
                 inputs[cache_key].kv.clear()
@@ -1548,6 +1561,7 @@ class InferenceManager:
                 if batch_size <= self.min_batch_size:
                     raise RuntimeError(
                         f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {e}"
+                        + self._out_of_memory_hint()
                     )
 
                 if self.verbose:
