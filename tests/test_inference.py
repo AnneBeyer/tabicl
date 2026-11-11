@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tabicl._model.inference import AsyncCopyManager, InferenceManager, devices_match
+from tabicl._model.inference import AsyncCopyManager, InferenceManager, OffloadMode, devices_match
 from tabicl._torch_devices import device_uses_unified_host_memory
 from tests.torch_devices_helpers import skip_if_device_unusable
 
@@ -364,3 +364,28 @@ def test_allocator_cap_warns_without_torch_support(monkeypatch):
     with pytest.warns(RuntimeWarning, match="cannot limit"):
         with mgr._cap_allocator_to_host_memory():
             pass
+
+
+@pytest.mark.parametrize(("with_disk", "expected"), [(False, OffloadMode.GPU), (True, OffloadMode.DISK)])
+def test_auto_offload_skips_cpu_on_integrated_gpu(monkeypatch, tmp_path, with_disk, expected):
+    """On an integrated GPU a CPU copy uses the same RAM, so AUTO offload goes to disk or stays on the device.
+
+    Non-regression test for https://github.com/soda-inria/tabicl/pull/179.
+    """
+    mgr = InferenceManager(enc_name="tf_col", out_dim=4)
+    disk_dir = str(tmp_path) if with_disk else None
+    mgr.configure(device="xpu", offload="auto", disk_offload_dir=disk_dir, use_amp=False, use_fa3=False)
+    monkeypatch.setattr(mgr, "_uses_unified_host_memory", lambda: True)
+
+    mode, _ = mgr._resolve_offload_mode(output_mb=400.0, gpu_free_mb=500.0, cpu_free_mb=8000.0, disk_free_mb=10_000.0)
+    assert mode is expected
+
+
+def test_cpu_output_not_pinned_on_integrated_gpu(monkeypatch):
+    """Pinning would lock the RAM an integrated GPU allocates from."""
+    mgr = InferenceManager(enc_name="tf_col", out_dim=4)
+    mgr.configure(device="xpu", offload="cpu", use_amp=False, use_fa3=False)
+    monkeypatch.setattr(mgr, "_uses_unified_host_memory", lambda: True)
+
+    out, _ = mgr._allocate_output_buffer(OffloadMode.CPU, (2, 3), torch.float32)
+    assert not out.is_pinned()

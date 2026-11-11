@@ -1098,6 +1098,8 @@ class InferenceManager:
 
         For AUTO mode, the priority is:
             GPU (if within threshold) -> CPU -> DISK -> CPU(swap as last resort).
+        On integrated GPUs and MPS, a CPU copy uses the same RAM, so AUTO skips it:
+            GPU (if within threshold) -> DISK -> GPU.
 
         Note: CPU mode can use either pinned or non-pinned memory.
         - Pinned memory: faster for async GPU-CPU transfers, but locks physical memory
@@ -1169,6 +1171,12 @@ class InferenceManager:
                 "auto_gpu_fits",
                 f"{output_mb:.0f}MB <= {self.auto_offload_threshold * gpu_free_mb:.0f}MB safe gpu free",
             )
+        elif self._uses_unified_host_memory() is True:
+            if disk_fits:
+                return OffloadMode.DISK, OffloadReason(
+                    "auto_unified_disk", f"gpu tight -> disk ({output_mb:.0f}MB <= {safe_disk_mb:.0f}MB safe disk free)"
+                )
+            return OffloadMode.GPU, OffloadReason("auto_unified_gpu", "gpu tight, no disk -> gpu (cpu is the same memory)")
         elif cpu_fits:
             return OffloadMode.CPU, OffloadReason(
                 "auto_cpu_fits", f"gpu tight -> cpu ({output_mb:.0f}MB <= {safe_cpu_mb:.0f}MB safe cpu free)"
@@ -1197,13 +1205,19 @@ class InferenceManager:
                 return out, info
             except RuntimeError as e:
                 info["alloc_error"] = str(e)
-                # Fallback to CPU
-                mode = OffloadMode.CPU
+                if self._uses_unified_host_memory() is not True:
+                    mode = OffloadMode.CPU
+                elif self.disk_offload_dir is not None:
+                    # CPU memory is the same RAM on integrated GPUs and MPS.
+                    mode = OffloadMode.DISK
+                else:
+                    raise
 
         if mode == OffloadMode.CPU:
             try:
                 # Only use pinned memory for smaller allocations
-                use_pinned = output_mb <= self.max_pinned_memory_mb
+                # Pinning locks the RAM that integrated GPUs and MPS allocate from.
+                use_pinned = output_mb <= self.max_pinned_memory_mb and self._uses_unified_host_memory() is not True
                 if self.verbose and not use_pinned:
                     print(
                         f"  Using regular (non-pinned) CPU memory for {output_mb:.0f}MB output (max_pinned={self.max_pinned_memory_mb:.0f}MB)"
