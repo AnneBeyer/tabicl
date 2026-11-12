@@ -18,10 +18,6 @@ except ImportError:
 
 _use_flash_attn3 = True
 
-# Largest number of attention scores (batch x heads x queries x keys) per SDPA call, per
-# device type. XPU's fp32 SDPA materializes the scores; calls above 2**31 of them faulted the GPU.
-_MAX_SDPA_SCORES = {"xpu": 2**31 - 1}
-
 
 @contextmanager
 def flash_attn3_toggle(enabled: bool):
@@ -129,32 +125,12 @@ def sdpa_with_flattened_batch(
         out = flash_attn3(q_fa, k_fa, v_fa, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k)
         out = out.view(flat_bs, seqlen_q, nheads, headdim).transpose(1, 2).to(orig_dtype)
     else:
-        out = _sdpa_in_chunks(q, k, v, attn_mask, dropout_p)
+        if q.device.type == "xpu":
+            # XPU's fp32 SDPA faults the GPU on strided inputs once the scores exceed 4 GiB.
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p)
 
     return out.view(q_shape)
-
-
-def _sdpa_in_chunks(q: Tensor, k: Tensor, v: Tensor, attn_mask: Optional[Tensor], dropout_p: float) -> Tensor:
-    """Run SDPA on 4D inputs, split over batch and queries so that no call exceeds
-    ``_MAX_SDPA_SCORES`` for the device. Splitting queries does not change the result."""
-    max_scores = _MAX_SDPA_SCORES.get(q.device.type)
-    n, nh, tgt_len, _ = q.shape
-    scores_per_query = nh * k.shape[-2]
-    if max_scores is None or n * tgt_len * scores_per_query <= max_scores:
-        return F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p)
-
-    batch_step = max(1, max_scores // (tgt_len * scores_per_query))
-    query_step = max(1, min(tgt_len, max_scores // (batch_step * scores_per_query)))
-    out = None
-    for b in range(0, n, batch_step):
-        for s in range(0, tgt_len, query_step):
-            mask = None if attn_mask is None else attn_mask[b : b + batch_step, :, s : s + query_step]
-            q_chunk = q[b : b + batch_step, :, s : s + query_step]
-            chunk = F.scaled_dot_product_attention(q_chunk, k[b : b + batch_step], v[b : b + batch_step], mask, dropout_p)
-            if out is None:  # allocated from the first chunk to keep the dtype chosen under autocast
-                out = chunk.new_empty(n, nh, tgt_len, v.shape[-1])
-            out[b : b + batch_step, :, s : s + query_step] = chunk
-    return out
 
 
 def multi_head_attention_forward(
