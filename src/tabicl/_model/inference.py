@@ -814,6 +814,15 @@ class InferenceManager:
 
         self._is_configured = True
 
+    def _out_of_memory_hint(self) -> str:
+        """Suggestions to append to out-of-memory errors on devices that allocate from host RAM."""
+        if self._unified_host is not True:
+            return ""
+        return (
+            " This device allocates from host RAM: close other applications, set `disk_offload_dir` "
+            "on the estimator to store outputs on disk, or lower its `batch_size`."
+        )
+
     @contextmanager
     def _cap_allocator_to_host_memory(self):
         """Limit the device allocator to the usable host RAM (see ``cpu_safety_factor``).
@@ -1099,6 +1108,8 @@ class InferenceManager:
 
         For AUTO mode, the priority is:
             GPU (if within threshold) -> CPU -> DISK -> CPU(swap as last resort).
+        On integrated GPUs and MPS, a CPU copy uses the same RAM, so AUTO skips it:
+            GPU (if within threshold) -> DISK -> GPU.
 
         Note: CPU mode can use either pinned or non-pinned memory.
         - Pinned memory: faster for async GPU-CPU transfers, but locks physical memory
@@ -1170,6 +1181,12 @@ class InferenceManager:
                 "auto_gpu_fits",
                 f"{output_mb:.0f}MB <= {self.auto_offload_threshold * gpu_free_mb:.0f}MB safe gpu free",
             )
+        elif self._unified_host is True:
+            if disk_fits:
+                return OffloadMode.DISK, OffloadReason(
+                    "auto_unified_disk", f"gpu tight -> disk ({output_mb:.0f}MB <= {safe_disk_mb:.0f}MB safe disk free)"
+                )
+            return OffloadMode.GPU, OffloadReason("auto_unified_gpu", "gpu tight, no disk -> gpu (cpu is the same memory)")
         elif cpu_fits:
             return OffloadMode.CPU, OffloadReason(
                 "auto_cpu_fits", f"gpu tight -> cpu ({output_mb:.0f}MB <= {safe_cpu_mb:.0f}MB safe cpu free)"
@@ -1198,13 +1215,22 @@ class InferenceManager:
                 return out, info
             except RuntimeError as e:
                 info["alloc_error"] = str(e)
-                # Fallback to CPU
-                mode = OffloadMode.CPU
+                if self._unified_host is not True:
+                    mode = OffloadMode.CPU
+                elif self.disk_offload_dir is not None:
+                    # CPU memory is the same RAM on integrated GPUs and MPS.
+                    mode = OffloadMode.DISK
+                else:
+                    raise RuntimeError(
+                        f"Not enough memory for the {output_mb:.0f} MB {self.enc_name} output."
+                        + self._out_of_memory_hint()
+                    ) from e
 
         if mode == OffloadMode.CPU:
             try:
                 # Only use pinned memory for smaller allocations
-                use_pinned = output_mb <= self.max_pinned_memory_mb
+                # Pinning locks the RAM that integrated GPUs and MPS allocate from.
+                use_pinned = output_mb <= self.max_pinned_memory_mb and self._unified_host is not True
                 if self.verbose and not use_pinned:
                     print(
                         f"  Using regular (non-pinned) CPU memory for {output_mb:.0f}MB output (max_pinned={self.max_pinned_memory_mb:.0f}MB)"
@@ -1419,6 +1445,7 @@ class InferenceManager:
                 if total_bs <= self.min_batch_size:
                     raise RuntimeError(
                         f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {e}"
+                        + self._out_of_memory_hint()
                     )
                 # Retry in the batched loop below with half the batch size.
                 for cache_key in store_cache_keys:
@@ -1530,6 +1557,7 @@ class InferenceManager:
                 if batch_size <= self.min_batch_size:
                     raise RuntimeError(
                         f"Failed to execute even with minimum batch size {self.min_batch_size}. Error: {e}"
+                        + self._out_of_memory_hint()
                     )
 
                 if self.verbose:
