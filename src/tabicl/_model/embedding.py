@@ -89,7 +89,9 @@ class ColEmbedding(nn.Module):
         Number of classes for classification task. If 0, assumes regression task.
 
     reserve_cls_tokens : int, default=4
-        Number of slots to reserve for CLS tokens to avoid concatenation.
+        Number of slots to reserve for CLS tokens to avoid concatenation. The slots are
+        prepended to the feature axis of the output and zero-filled. They bypass the
+        column-wise set transformer entirely and are filled later by RowInteraction.
 
     ssmax : bool or str, default=False
         Type of scalable softmax to use in attention. Note that only the first attention layer of
@@ -465,15 +467,14 @@ class ColEmbedding(nn.Module):
         """Training path when feature grouping is enabled."""
         train_size = y_train.shape[1]
         X = self.feature_grouping(X)  # (B, T, G, group_size)
-        if self.reserve_cls_tokens > 0:
-            X = F.pad(X, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
 
-        features = X.transpose(1, 2)  # (B, G+C, T, group_size)
+        features = X.transpose(1, 2)  # (B, G, T, group_size)
         if self.target_aware:
             assert y_train is not None, "y_train must be provided when target_aware=True."
             y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
 
-        embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)
+        embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)  # (B, G, T, E)
+        embeddings = F.pad(embeddings, (0, 0, 0, 0, self.reserve_cls_tokens, 0))  # (B, G+C, T, E)
         return embeddings.transpose(1, 2)  # (B, T, G+C, E)
 
     def _train_forward_without_feature_group(
@@ -481,39 +482,35 @@ class ColEmbedding(nn.Module):
     ) -> Tensor:
         """Training path without feature grouping, supporting variable number of features per table."""
         train_size = y_train.shape[1]
-
-        if self.reserve_cls_tokens > 0:
-            X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
+        C = self.reserve_cls_tokens
 
         if d is None:
-            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
+            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
             if self.target_aware:
                 assert y_train is not None, "y_train must be provided when target_aware=True."
                 y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
-            embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)
+            embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)  # (B, H, T, E)
+            embeddings = F.pad(embeddings, (0, 0, 0, 0, C, 0))  # (B, H+C, T, E)
         else:
-            if self.reserve_cls_tokens > 0:
-                d = d + self.reserve_cls_tokens
-
-            B, T, HC = X.shape
-            X = X.transpose(1, 2)  # (B, H+C, T)
+            B, T, H = X.shape
+            X = X.transpose(1, 2)  # (B, H, T)
 
             # Create mask to extract non-empty features
-            indices = torch.arange(HC, device=X.device).unsqueeze(0).expand(B, HC)
-            mask = indices < d.unsqueeze(1)  # (B, H+C)
+            indices = torch.arange(H, device=X.device).unsqueeze(0).expand(B, H)
+            mask = indices < d.unsqueeze(1)  # (B, H)
             features = X[mask].unsqueeze(-1)  # (N, T, 1) where N = sum(d)
 
             if self.target_aware:
                 assert y_train is not None, "y_train must be provided when target_aware=True."
                 # Expand y_train for each non-empty feature: (B, train_size) -> (N, train_size)
-                y_train = y_train.unsqueeze(1).expand(-1, HC, -1)  # (B, H+C, train_size)
+                y_train = y_train.unsqueeze(1).expand(-1, H, -1)  # (B, H, train_size)
                 y_train = y_train[mask]  # (N, train_size)
 
             effective_embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)
 
-            # Fill computed embeddings back into full tensor
-            embeddings = torch.zeros(B, HC, T, self.embed_dim, device=X.device, dtype=effective_embeddings.dtype)
-            embeddings[mask] = effective_embeddings
+            # Fill computed embeddings back into full tensor, after the reserved CLS slots
+            embeddings = torch.zeros(B, H + C, T, self.embed_dim, device=X.device, dtype=effective_embeddings.dtype)
+            embeddings[:, C:][mask] = effective_embeddings
 
         return embeddings.transpose(1, 2)  # (B, T, H+C, E)
 
@@ -583,10 +580,8 @@ class ColEmbedding(nn.Module):
         """Inference path when feature grouping is enabled."""
 
         X = self.feature_grouping(X)  # (B, T, G, group_size)
-        if self.reserve_cls_tokens > 0:
-            X = F.pad(X, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
 
-        features = X.transpose(1, 2)  # (B, G+C, T, group_size)
+        features = X.transpose(1, 2)  # (B, G, T, group_size)
         if self.target_aware:
             assert y_train is not None, "y_train must be provided when target_aware=True."
             y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
@@ -603,7 +598,8 @@ class ColEmbedding(nn.Module):
                     ("embed_with_test", embed_with_test),
                 ]
             ),
-        )
+            reserve=self.reserve_cls_tokens,
+        )  # (B, G+C, T, E)
 
     def _inference_without_feature_group(
         self,
@@ -616,10 +612,7 @@ class ColEmbedding(nn.Module):
         """Inference path when feature grouping is disabled."""
 
         if feature_shuffles is None:
-            if self.reserve_cls_tokens > 0:
-                X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
-
-            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
+            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
             if self.target_aware:
                 assert y_train is not None, "y_train must be provided when target_aware=True."
                 y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
@@ -636,15 +629,13 @@ class ColEmbedding(nn.Module):
                         ("embed_with_test", embed_with_test),
                     ]
                 ),
-            )
+                reserve=self.reserve_cls_tokens,
+            )  # (B, H+C, T, E)
         else:
             # Shuffle optimisation: compute once, reorder for each table
             B = X.shape[0]
             first_table = X[0]
-            if self.reserve_cls_tokens > 0:
-                first_table = F.pad(first_table, (self.reserve_cls_tokens, 0), value=-100.0)
-
-            features = first_table.transpose(0, 1).unsqueeze(-1)  # (H+C, T, 1)
+            features = first_table.transpose(0, 1).unsqueeze(-1)  # (H, T, 1)
             if self.target_aware:
                 assert y_train is not None, "y_train must be provided when target_aware=True."
                 y_first = y_train[0].unsqueeze(0).expand(features.shape[0], -1)
@@ -662,7 +653,8 @@ class ColEmbedding(nn.Module):
                     ]
                 ),
                 output_repeat=B,
-            )
+                reserve=self.reserve_cls_tokens,
+            )  # (H+C, T, E)
 
             # Apply shuffles for tables after the first one
             embeddings = first_embeddings.unsqueeze(0).repeat(B, 1, 1, 1)  # (B, H+C, T, E)
@@ -861,13 +853,16 @@ class ColEmbedding(nn.Module):
 
         if self.feature_group:
             X = self.feature_grouping(X)  # (B, T, G, group_size)
-            if self.reserve_cls_tokens > 0:
-                X = F.pad(X, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
-            features = X.transpose(1, 2)  # (B, G+C, T, group_size)
+            features = X.transpose(1, 2)  # (B, G, T, group_size)
         else:
-            if self.reserve_cls_tokens > 0:
-                X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
-            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
+            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H, T, 1)
+
+        if use_cache and self.reserve_cls_tokens > 0:
+            # Caches stored by earlier versions, where the reserved CLS slots went through the
+            # set transformer, also hold K/V for these slots. Drop them to match the features.
+            entry = next((e for e in col_cache.kv.values() if e.is_valid()), None)
+            if entry is not None and entry.key.shape[1] == features.shape[1] + self.reserve_cls_tokens:
+                col_cache = col_cache[:, self.reserve_cls_tokens :]
 
         if store_cache:
             train_size = y_train.shape[1]
@@ -888,5 +883,6 @@ class ColEmbedding(nn.Module):
                     ("store_cache", store_cache),
                 ]
             ),
-        )
+            reserve=self.reserve_cls_tokens,
+        )  # (B, G+C, T, E)
         return embeddings.transpose(1, 2)

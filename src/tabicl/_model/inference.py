@@ -17,6 +17,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .kv_cache import KVCache
@@ -1237,6 +1238,7 @@ class InferenceManager:
         inputs: OrderedDict[str, Any],
         auto_batch: bool = True,
         output_repeat: int = 1,
+        reserve: int = 0,
     ) -> Tensor:
         """Execute forward pass with automatic batching and memory management.
 
@@ -1265,6 +1267,12 @@ class InferenceManager:
             the output will be manipulated to create multiple derived outputs in
             subsequent operations (e.g. shuffled multiple times for feature ordering).
 
+        reserve : int, default=0
+            Number of zero-filled slots to prepend to the last batch dimension of the
+            output. These slots are allocated together with the output buffer but are
+            never passed to ``forward_fn``, so callers can fill them in place later
+            without concatenation.
+
         Returns
         -------
         Tensor
@@ -1290,12 +1298,12 @@ class InferenceManager:
 
         # Non-batched execution
         if not auto_batch:
-            return self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            return self._pad_reserved(self._run_forward(forward_fn, self._prepare_inputs(inputs)), reserve)
 
         # CPU: no accelerator memory APIs for safe batch sizing; still route
         # through _run_forward so AMP/no_grad wrapping stays consistent.
         if self.exe_device.type == "cpu":
-            return self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            return self._pad_reserved(self._run_forward(forward_fn, self._prepare_inputs(inputs)), reserve)
 
         # Extract shape/dtype info
         first_value = next(iter(inputs.values()))
@@ -1318,11 +1326,12 @@ class InferenceManager:
                 f"estimated batch size for {self.enc_name}: {batch_size}"
             )
 
-        # Calculate output shape
+        # Calculate output shape (including reserved slots)
+        out_batch_dims = (*batch_dims[:-1], batch_dims[-1] + reserve)
         if self.out_no_seq:
-            output_shape = (*batch_dims, self.out_dim)
+            output_shape = (*out_batch_dims, self.out_dim)
         else:
-            output_shape = (*batch_dims, seq_len, self.out_dim)
+            output_shape = (*out_batch_dims, seq_len, self.out_dim)
 
         # Estimate output size
         output_mb = self._estimate_tensor_mb(tuple(output_shape), input_dtype, repeat=output_repeat)
@@ -1344,7 +1353,7 @@ class InferenceManager:
 
         # Single batch case
         if batch_size >= total_bs:
-            out = self._run_forward(forward_fn, self._prepare_inputs(inputs))
+            out = self._pad_reserved(self._run_forward(forward_fn, self._prepare_inputs(inputs)), reserve)
 
             if mode == OffloadMode.GPU:
                 return out
@@ -1361,6 +1370,9 @@ class InferenceManager:
 
         # Multi-batch execution
         outputs, _ = self._allocate_output_buffer(mode, tuple(output_shape), input_dtype)
+        if reserve > 0:
+            base = outputs.tensor if isinstance(outputs, DiskTensor) else outputs
+            base[self._reserved_index(reserve)].zero_()
 
         # Setup async copy manager if using async and offloading
         async_copy: Optional[AsyncCopyManager] = None
@@ -1407,11 +1419,18 @@ class InferenceManager:
                                 original_cache.preallocate(batch_cache, tuple(batch_dims), device=self.exe_device)
                             original_cache[indices] = batch_cache
 
+                    # Output positions are shifted past the reserved slots (caches are not)
+                    if reserve > 0:
+                        last = indices[-1]
+                        out_indices = (*indices[:-1], slice(last.start + reserve, last.stop + reserve))
+                    else:
+                        out_indices = indices
+
                     if mode == OffloadMode.GPU:
-                        outputs[indices] = out
+                        outputs[out_indices] = out
                     else:
                         if async_copy is not None:
-                            async_copy.submit_copy(out, outputs, indices)
+                            async_copy.submit_copy(out, outputs, out_indices)
                             # Check if we need to flush (async manager tracks bytes internally)
                             if isinstance(outputs, DiskTensor) and self.disk_flush_mb > 0:
                                 if async_copy.get_bytes_written() >= self.disk_flush_mb:
@@ -1419,7 +1438,7 @@ class InferenceManager:
                                     async_copy.reset_bytes_counter()
                         else:
                             out_cpu = out.cpu()
-                            outputs[indices] = out_cpu
+                            outputs[out_indices] = out_cpu
                             bytes_since_flush_mb += out_cpu.numel() * out_cpu.element_size() / (1024 * 1024)
 
                             # Periodic flush for disk
@@ -1461,6 +1480,16 @@ class InferenceManager:
                 self._empty_backend_cache()
 
                 batch_size = max(self.min_batch_size, batch_size // 2)
+
+    def _reserved_index(self, reserve: int) -> Tuple[Any, ...]:
+        """Index selecting the reserved slots of the last batch dimension of an output."""
+        return (..., slice(0, reserve)) + (slice(None),) * (1 if self.out_no_seq else 2)
+
+    def _pad_reserved(self, out: Tensor, reserve: int) -> Tensor:
+        """Prepend ``reserve`` zero-filled slots to the last batch dimension of ``out``."""
+        if reserve == 0:
+            return out
+        return F.pad(out, (0, 0) * (1 if self.out_no_seq else 2) + (reserve, 0))
 
     @staticmethod
     def compute_split_sizes(batch_dims: Tuple[int], batch_size: int) -> List[int]:
